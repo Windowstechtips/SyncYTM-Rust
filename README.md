@@ -9,6 +9,8 @@
 
 <br>
 
+# SyncYTM in React
+
 **Listen to YouTube Music together in sync.**
 
 A small, fast, native desktop app written in Rust.
