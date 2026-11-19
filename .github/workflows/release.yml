@@ -1,0 +1,91 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target_name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target_name: windows-x64
+            bin_name: syncytm-native.exe
+            archive_ext: zip
+
+          - os: ubuntu-latest
+            target_name: linux-x64
+            bin_name: syncytm-native
+            archive_ext: tar.gz
+
+          - os: macos-latest
+            target_name: macos-arm64
+            bin_name: syncytm-native
+            archive_ext: tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev \
+            libasound2-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libgtk-3-dev \
+            libgl1-mesa-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/release/${{ matrix.bin_name }}" "dist/"
+          Compress-Archive -Path "dist/${{ matrix.bin_name }}" -DestinationPath "dist/syncytm-native-${{ matrix.target_name }}.zip"
+
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin_name }}" "dist/"
+          tar -czf "dist/syncytm-native-${{ matrix.target_name }}.tar.gz" -C dist "${{ matrix.bin_name }}"
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/syncytm-native-${{ matrix.target_name }}.${{ matrix.archive_ext }}
+
+      - name: Upload workflow artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncytm-native-${{ matrix.target_name }}
+          path: dist/syncytm-native-${{ matrix.target_name }}.${{ matrix.archive_ext }}
