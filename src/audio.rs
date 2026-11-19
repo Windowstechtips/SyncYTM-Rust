@@ -1,7 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -136,18 +136,6 @@ impl AudioEngine {
         })
     }
 
-    fn find_ffmpeg() -> PathBuf {
-        if let Ok(p) = std::env::var("FFMPEG_PATH") {
-            if Path::new(&p).exists() {
-                return PathBuf::from(p);
-            }
-        }
-        if Path::new("C:\\ffmpeg\\bin\\ffmpeg.exe").exists() {
-            return PathBuf::from("C:\\ffmpeg\\bin\\ffmpeg.exe");
-        }
-        PathBuf::from("ffmpeg")
-    }
-
     fn spawn_feeder_worker(
         state: Arc<AudioState>,
         tx: crossbeam_channel::Sender<f32>,
@@ -155,7 +143,6 @@ impl AudioEngine {
         channels: u16,
     ) {
         thread::spawn(move || {
-            let ffmpeg = Self::find_ffmpeg();
             let sr_str = sample_rate.to_string();
             let ch_str = channels.to_string();
             let mut last_gen = 0u64;
@@ -174,6 +161,8 @@ impl AudioEngine {
                     continue;
                 };
 
+                let ffmpeg = crate::deps::find_ffmpeg().unwrap_or_else(|| PathBuf::from("ffmpeg"));
+
                 let maybe_seek = state.pending_seek_sec.lock().unwrap().take();
                 let is_seek = maybe_seek.is_some();
                 let start_sec = if let Some(s) = maybe_seek {
@@ -184,7 +173,7 @@ impl AudioEngine {
 
                 // Fast-startup, smooth streaming flags:
                 // Input seeking (-ss before -i) + 64KB probesize for 300ms startup
-                let child = Command::new(&ffmpeg)
+                let child = crate::deps::create_command(&ffmpeg)
                     .args([
                         "-probesize",
                         "65536",

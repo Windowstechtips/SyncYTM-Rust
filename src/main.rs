@@ -13,6 +13,7 @@ macro_rules! log_debug {
 mod app;
 mod audio;
 mod config;
+mod deps;
 mod discord;
 mod models;
 mod realtime;

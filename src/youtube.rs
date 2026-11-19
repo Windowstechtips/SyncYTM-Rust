@@ -1,7 +1,6 @@
 use crate::config::YOUTUBE_API_KEY;
 use crate::models::VideoItem;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 pub struct YoutubeService {
     yt_dlp_path: PathBuf,
@@ -10,39 +9,20 @@ pub struct YoutubeService {
 
 impl YoutubeService {
     pub fn new() -> Self {
-        let yt_dlp_path = Self::find_yt_dlp();
+        let yt_dlp_path = crate::deps::find_yt_dlp().unwrap_or_else(|| PathBuf::from("yt-dlp"));
         Self {
             yt_dlp_path,
             client: reqwest::Client::new(),
         }
     }
 
-    fn find_yt_dlp() -> PathBuf {
-        // 1. Current directory
-        if Path::new("yt-dlp.exe").exists() {
-            return PathBuf::from("yt-dlp.exe");
-        }
-        // 2. Next to executable
-        if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(Path::new("")).to_path_buf()) {
-            let candidate = exe_dir.join("yt-dlp.exe");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-        // 3. User cargo bin directory
-        if let Ok(home) = std::env::var("USERPROFILE") {
-            let candidate = PathBuf::from(home).join(".cargo").join("bin").join("yt-dlp.exe");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-        // 4. Default to system PATH
-        PathBuf::from("yt-dlp")
+    fn get_yt_dlp(&self) -> PathBuf {
+        crate::deps::find_yt_dlp().unwrap_or_else(|| self.yt_dlp_path.clone())
     }
 
     /// Extract direct audio stream URL and duration in seconds from YouTube video ID or URL
     pub async fn resolve_audio_url(&self, video_id: &str) -> Result<(String, f64), String> {
-        let yt_dlp = self.yt_dlp_path.clone();
+        let yt_dlp = self.get_yt_dlp();
         let target_url = if video_id.starts_with("http") {
             video_id.to_string()
         } else {
@@ -50,7 +30,7 @@ impl YoutubeService {
         };
 
         tokio::task::spawn_blocking(move || {
-            let output = Command::new(&yt_dlp)
+            let output = crate::deps::create_command(&yt_dlp)
                 .args(["--print", "%(duration)s", "-g", "-f", "ba/b", "--no-warnings", &target_url])
                 .output()
                 .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
@@ -138,11 +118,11 @@ impl YoutubeService {
     }
 
     async fn search_yt_dlp(&self, query: &str) -> Result<Vec<VideoItem>, String> {
-        let yt_dlp = self.yt_dlp_path.clone();
+        let yt_dlp = self.get_yt_dlp();
         let search_arg = format!("ytsearch10:{}", query);
 
         tokio::task::spawn_blocking(move || {
-            let output = Command::new(&yt_dlp)
+            let output = crate::deps::create_command(&yt_dlp)
                 .args(["--dump-json", "--flat-playlist", "--no-warnings", &search_arg])
                 .output()
                 .map_err(|e| format!("Failed to run yt-dlp search: {}", e))?;
@@ -180,11 +160,11 @@ impl YoutubeService {
 
     /// Fetch all video items from a YouTube or YouTube Music playlist
     pub async fn fetch_playlist(&self, playlist_url: &str) -> Result<Vec<VideoItem>, String> {
-        let yt_dlp = self.yt_dlp_path.clone();
+        let yt_dlp = self.get_yt_dlp();
         let url = playlist_url.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let output = Command::new(&yt_dlp)
+            let output = crate::deps::create_command(&yt_dlp)
                 .args(["--dump-json", "--flat-playlist", "--no-warnings", &url])
                 .output()
                 .map_err(|e| format!("Failed to run yt-dlp playlist extraction: {}", e))?;

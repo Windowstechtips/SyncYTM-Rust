@@ -5,7 +5,7 @@ use crate::realtime::{RealtimeClient, RealtimeEvent};
 use crate::supabase::SupabaseService;
 use crate::youtube::YoutubeService;
 use eframe::egui::{self, Color32, Margin, RichText, Stroke, Vec2};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -142,10 +142,33 @@ pub struct SyncYtmApp {
     rx_import: Option<crossbeam_channel::Receiver<Result<Vec<VideoItem>, String>>>,
     tx_track_resolved: crossbeam_channel::Sender<Result<TrackResolvedPayload, String>>,
     rx_track_resolved: crossbeam_channel::Receiver<Result<TrackResolvedPayload, String>>,
+
+    // Prefetch cache: video_id -> (audio_url, duration_sec)
+    // Pre-resolves the next song while the current one plays, eliminating startup lag.
+    prefetch_cache: HashMap<String, (String, f64)>,
+    tx_prefetch: crossbeam_channel::Sender<(String, String, f64)>, // (video_id, url, duration)
+    rx_prefetch: crossbeam_channel::Receiver<(String, String, f64)>,
+    prefetching_id: Option<String>, // video_id currently being prefetched
+
+    // Dependency auto-installer state
+    deps_status: crate::deps::DependencyStatus,
+    rx_deps: Option<crossbeam_channel::Receiver<crate::deps::DependencyStatus>>,
+    deps_banner_dismiss_at: Option<Instant>,
 }
 
 impl SyncYtmApp {
     pub fn new() -> Self {
+        let (need_ytdlp, need_ffmpeg) = crate::deps::check_missing();
+        let (deps_status, rx_deps) = if need_ytdlp || need_ffmpeg {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            tokio::spawn(async move {
+                crate::deps::install_dependencies(tx, need_ytdlp, need_ffmpeg).await;
+            });
+            (crate::deps::DependencyStatus::Checking, Some(rx))
+        } else {
+            (crate::deps::DependencyStatus::Ready, None)
+        };
+
         let supabase = Arc::new(SupabaseService::new());
         let youtube = Arc::new(YoutubeService::new());
         let audio_engine = AudioEngine::new().expect("Failed to initialize audio engine");
@@ -153,6 +176,7 @@ impl SyncYtmApp {
         let _audio_stream = audio_engine.stream;
         let discord = Arc::new(DiscordManager::new());
         let (tx_track_resolved, rx_track_resolved) = crossbeam_channel::unbounded();
+        let (tx_prefetch, rx_prefetch) = crossbeam_channel::unbounded();
 
         let saved_session = load_saved_session();
         let initial_screen = if saved_session.is_some() { Screen::Lobby } else { Screen::Auth };
@@ -225,6 +249,15 @@ impl SyncYtmApp {
             rx_import: None,
             tx_track_resolved,
             rx_track_resolved,
+
+            prefetch_cache: HashMap::new(),
+            tx_prefetch,
+            rx_prefetch,
+            prefetching_id: None,
+
+            deps_status,
+            rx_deps,
+            deps_banner_dismiss_at: None,
         };
 
         if app.user_session.is_some() {
@@ -232,6 +265,21 @@ impl SyncYtmApp {
         }
 
         app
+    }
+
+    pub fn retry_dependency_install(&mut self) {
+        let (need_ytdlp, need_ffmpeg) = crate::deps::check_missing();
+        if need_ytdlp || need_ffmpeg {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            self.deps_status = crate::deps::DependencyStatus::Checking;
+            self.rx_deps = Some(rx);
+            tokio::spawn(async move {
+                crate::deps::install_dependencies(tx, need_ytdlp, need_ffmpeg).await;
+            });
+        } else {
+            self.deps_status = crate::deps::DependencyStatus::Ready;
+            self.rx_deps = None;
+        }
     }
 
     fn has_controls(&self) -> bool {
@@ -333,27 +381,46 @@ impl SyncYtmApp {
             self.track_duration_sec = dur;
         }
 
+        // Stop old audio immediately so it doesn't keep playing during URL resolution
+        self.audio.stop();
+
         self.current_video = Some(video.clone());
         self.is_playing = true;
         self.last_seek_time = Instant::now();
-        self.is_resolving_track = true;
         self.audio.reset_finished();
 
-        let yt = self.youtube.clone();
-        let vid_id = video.id.clone();
-        let tx = self.tx_track_resolved.clone();
-        let vid_clone = video.clone();
+        // Evict the prefetch entry for this song (we're about to use it)
+        let cached = self.prefetch_cache.remove(&video.id);
 
-        tokio::spawn(async move {
-            match yt.resolve_audio_url(&vid_id).await {
-                Ok((url, duration)) => {
-                    let _ = tx.send(Ok((url, duration, vid_clone, 0.0, true)));
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                }
+        if let Some((url, duration)) = cached {
+            // Cache hit → instant playback, no yt-dlp wait
+            crate::log_debug!("[Prefetch] Cache HIT for '{}' — playing instantly", video.title);
+            self.is_resolving_track = false;
+            self.track_duration_sec = duration;
+            self.audio.play(&url, 0.0);
+            // Start prefetching the song after this one
+            if let Some(next) = self.peek_next_video(&video.id).cloned() {
+                self.start_prefetch(&next);
             }
-        });
+        } else {
+            // Cache miss → resolve via yt-dlp (normal path)
+            crate::log_debug!("[Prefetch] Cache MISS for '{}' — resolving via yt-dlp", video.title);
+            self.is_resolving_track = true;
+            let yt = self.youtube.clone();
+            let vid_id = video.id.clone();
+            let tx = self.tx_track_resolved.clone();
+            let vid_clone = video.clone();
+            tokio::spawn(async move {
+                match yt.resolve_audio_url(&vid_id).await {
+                    Ok((url, duration)) => {
+                        let _ = tx.send(Ok((url, duration, vid_clone, 0.0, true)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            });
+        }
 
         if let Some(ref rt) = self.realtime {
             rt.send(SyncData::PlayVideo {
@@ -438,8 +505,35 @@ impl SyncYtmApp {
         }
     }
 
-    fn poll_async_tasks(&mut self) {
-        // 0. Token Refresh task
+    /// Kick off a background yt-dlp resolve for `video` if it isn't already in the cache
+    /// or currently being fetched. The result lands in `rx_prefetch`.
+    fn start_prefetch(&mut self, video: &VideoItem) {
+        let id = video.id.clone();
+        // Already cached or already in-flight → skip
+        if self.prefetch_cache.contains_key(&id) {
+            return;
+        }
+        if self.prefetching_id.as_deref() == Some(&id) {
+            return;
+        }
+        self.prefetching_id = Some(id.clone());
+        let yt = self.youtube.clone();
+        let tx = self.tx_prefetch.clone();
+        crate::log_debug!("[Prefetch] Starting background resolve for: {}", video.title);
+        tokio::spawn(async move {
+            if let Ok((url, duration)) = yt.resolve_audio_url(&id).await {
+                let _ = tx.send((id, url, duration));
+            }
+        });
+    }
+
+    /// Return the next song in the queue after `current_id`, or None.
+    fn peek_next_video(&self, current_id: &str) -> Option<&VideoItem> {
+        let idx = self.queue.iter().position(|v| v.id == current_id)?;
+        self.queue.get(idx + 1)
+    }
+
+    fn poll_async_tasks(&mut self) {        // 0. Token Refresh task
         if let Some(ref rx) = self.rx_refresh {
             if let Ok(res) = rx.try_recv() {
                 match res {
@@ -563,7 +657,7 @@ impl SyncYtmApp {
         while let Ok(res) = self.rx_track_resolved.try_recv() {
             self.is_resolving_track = false;
             match res {
-                Ok((url, duration, video, start_time, play_flag)) => {
+                Ok((url, duration, _video, start_time, play_flag)) => {
                     self.track_duration_sec = duration;
                     self.audio.play(&url, start_time);
                     if !play_flag {
@@ -572,11 +666,34 @@ impl SyncYtmApp {
                         // Automatically trigger precision resync 2.5s after audio loads and starts playing
                         self.auto_resync_at = Some(Instant::now() + Duration::from_millis(2500));
                     }
-                    crate::log_debug!("[Audio] Track started: {} ({:.1}s) at {:.1}s", video.title, duration, start_time);
+                    crate::log_debug!("[Audio] Track started: {} ({:.1}s) at {:.1}s", _video.title, duration, start_time);
+                    // Kick off prefetch for the next song now that this one is playing
+                    if let Some(next) = self.peek_next_video(&_video.id).cloned() {
+                        self.start_prefetch(&next);
+                    }
                 }
-                Err(e) => {
-                    crate::log_debug!("[Audio] Track resolution failed: {}", e);
+                Err(_e) => {
+                    crate::log_debug!("[Audio] Track resolution failed: {}", _e);
                 }
+            }
+        }
+
+        // 6b. Prefetch results — store resolved URLs in cache for instant playback
+        while let Ok((id, url, duration)) = self.rx_prefetch.try_recv() {
+            crate::log_debug!("[Prefetch] Cached audio URL for video_id: {}", id);
+            self.prefetch_cache.insert(id.clone(), (url, duration));
+            if self.prefetching_id.as_deref() == Some(&id) {
+                self.prefetching_id = None;
+            }
+        }
+
+        // 7. Dependency auto-installer task
+        if let Some(ref rx) = self.rx_deps {
+            while let Ok(status) = rx.try_recv() {
+                if status.is_ready() {
+                    self.deps_banner_dismiss_at = Some(Instant::now() + Duration::from_secs(4));
+                }
+                self.deps_status = status;
             }
         }
     }
@@ -786,24 +903,44 @@ impl SyncYtmApp {
                 self.current_video = Some(video.clone());
                 self.is_playing = true;
                 self.last_seek_time = Instant::now();
-                self.is_resolving_track = true;
+                // Stop old audio immediately — prevents the old song from
+                // continuing to play while yt-dlp resolves the new URL
+                self.audio.stop();
                 self.audio.reset_finished();
 
-                let yt = self.youtube.clone();
-                let vid_id = video.id.clone();
-                let tx = self.tx_track_resolved.clone();
-                let vid_clone = video.clone();
+                // Evict the prefetch entry for this song (we're about to use it)
+                let cached = self.prefetch_cache.remove(&video.id);
 
-                tokio::spawn(async move {
-                    match yt.resolve_audio_url(&vid_id).await {
-                        Ok((url, duration)) => {
-                            let _ = tx.send(Ok((url, duration, vid_clone, 0.0, true)));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                        }
+                if let Some((url, duration)) = cached {
+                    // Cache hit → instant playback
+                    crate::log_debug!("[Prefetch] Cache HIT (peer) for '{}' — playing instantly", video.title);
+                    self.is_resolving_track = false;
+                    self.track_duration_sec = duration;
+                    self.audio.play(&url, 0.0);
+                    self.auto_resync_at = Some(Instant::now() + Duration::from_millis(2500));
+                    // Prefetch the next track
+                    if let Some(next) = self.peek_next_video(&video.id).cloned() {
+                        self.start_prefetch(&next);
                     }
-                });
+                } else {
+                    // Cache miss → resolve via yt-dlp
+                    crate::log_debug!("[Prefetch] Cache MISS (peer) for '{}' — resolving via yt-dlp", video.title);
+                    self.is_resolving_track = true;
+                    let yt = self.youtube.clone();
+                    let vid_id = video.id.clone();
+                    let tx = self.tx_track_resolved.clone();
+                    let vid_clone = video.clone();
+                    tokio::spawn(async move {
+                        match yt.resolve_audio_url(&vid_id).await {
+                            Ok((url, duration)) => {
+                                let _ = tx.send(Ok((url, duration, vid_clone, 0.0, true)));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                            }
+                        }
+                    });
+                }
             }
             SyncData::QueueAdd { video } => {
                 if !self.queue.iter().any(|v| v.id == video.id) {
@@ -839,7 +976,7 @@ impl SyncYtmApp {
                 });
             }
             SyncData::TimePing { time, host_sent_at } => {
-                if !self.is_host && self.is_playing {
+                if !self.is_host && self.is_playing && !self.is_resolving_track {
                     let transit = if let Some(sent) = host_sent_at {
                         let now_ms = current_epoch_ms();
                         ((now_ms - sent).max(0.0) / 1000.0).min(5.0)
@@ -954,11 +1091,13 @@ impl SyncYtmApp {
             if let Some(ref r) = self.current_room {
                 let title = self.current_video.as_ref().map(|v| v.title.as_str()).unwrap_or("");
                 let artist = self.current_video.as_ref().map(|v| v.channel.as_str()).unwrap_or("");
+                let thumbnail = self.current_video.as_ref().and_then(|v| v.thumbnail.as_deref());
                 self.discord.update_presence(
                     title,
                     artist,
                     &r.name,
                     &r.id,
+                    thumbnail,
                     self.is_playing,
                     self.audio.get_time_sec(),
                     self.track_duration_sec,
@@ -1006,6 +1145,8 @@ impl eframe::App for SyncYtmApp {
         self.handle_realtime_events();
         self.check_periodic_tasks();
 
+        self.ui_deps_banner(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| match self.screen {
             Screen::Auth => self.ui_auth(ui),
             Screen::Lobby => self.ui_lobby(ui),
@@ -1030,6 +1171,95 @@ const WARNING: Color32       = Color32::from_rgb(240, 180, 40);
 const INFO: Color32          = Color32::from_rgb(99, 179, 237);
 
 impl SyncYtmApp {
+    fn ui_deps_banner(&mut self, ctx: &egui::Context) {
+        let show = match &self.deps_status {
+            crate::deps::DependencyStatus::Ready => {
+                if let Some(dismiss_at) = self.deps_banner_dismiss_at {
+                    Instant::now() < dismiss_at
+                } else {
+                    false
+                }
+            }
+            _ => true,
+        };
+
+        if !show {
+            return;
+        }
+
+        let mut retry_clicked = false;
+
+        egui::TopBottomPanel::top("deps_install_banner")
+            .frame(
+                egui::Frame::none()
+                    .fill(BG_CARD)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(Margin::symmetric(16.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    match &self.deps_status {
+                        crate::deps::DependencyStatus::Checking => {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Checking required media components...")
+                                    .size(12.0)
+                                    .color(TEXT_PRIMARY),
+                            );
+                        }
+                        crate::deps::DependencyStatus::Downloading {
+                            item,
+                            progress_pct,
+                            details,
+                        } => {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!("Downloading required media tool ({})", item))
+                                    .size(12.0)
+                                    .color(TEXT_PRIMARY),
+                            );
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::ProgressBar::new(*progress_pct)
+                                    .desired_width(180.0)
+                                    .text(details.as_str()),
+                            );
+                        }
+                        crate::deps::DependencyStatus::Extracting { item } => {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!("Installing {}...", item))
+                                    .size(12.0)
+                                    .color(TEXT_PRIMARY),
+                            );
+                        }
+                        crate::deps::DependencyStatus::Ready => {
+                            ui.label(
+                                RichText::new("✓ Media tools (yt-dlp & ffmpeg) are ready!")
+                                    .size(12.0)
+                                    .color(SUCCESS),
+                            );
+                        }
+                        crate::deps::DependencyStatus::Error(err) => {
+                            ui.label(
+                                RichText::new(format!("⚠️ Media tool setup error: {}", err))
+                                    .size(12.0)
+                                    .color(BORDER_ACTIVE),
+                            );
+                            ui.add_space(8.0);
+                            if ui.button("Retry Installation").clicked() {
+                                retry_clicked = true;
+                            }
+                        }
+                    }
+                });
+            });
+
+        if retry_clicked {
+            self.retry_dependency_install();
+        }
+    }
+
     fn ui_auth(&mut self, ui: &mut egui::Ui) {
         // Fill the whole panel background
         let rect = ui.available_rect_before_wrap();
@@ -1353,7 +1583,7 @@ impl SyncYtmApp {
                     .inner_margin(Margin::same(14.0))
                     .rounding(4.0)
                     .show(ui, |ui| {
-                        ui.label(RichText::new("Room UUID").size(12.0).color(TEXT_MUTED));
+                        ui.label(RichText::new("Room UUID or invite link").size(12.0).color(TEXT_MUTED));
                         ui.add_space(2.0);
                         ui.add(egui::TextEdit::singleline(&mut self.direct_room_id).desired_width(f32::INFINITY));
                         ui.add_space(6.0);
@@ -1395,7 +1625,14 @@ impl SyncYtmApp {
         let Some(ref u) = self.user_session else { return; };
         let sb = self.supabase.clone();
         let token = u.access_token.clone();
-        let room_id = self.direct_room_id.trim().to_string();
+
+        // Accept a full syncytm.netlify.app/room/<id> link or a bare UUID
+        let raw = self.direct_room_id.trim().to_string();
+        let room_id = if let Some(idx) = raw.find("/room/") {
+            raw[idx + "/room/".len()..].trim_matches('/').to_string()
+        } else {
+            raw
+        };
 
         let (tx, rx) = crossbeam_channel::bounded(1);
         tokio::spawn(async move {
@@ -1424,6 +1661,8 @@ impl SyncYtmApp {
         self.queue.clear();
         self.current_video = None;
         self.is_playing = false;
+        self.prefetch_cache.clear();
+        self.prefetching_id = None;
         self.screen = Screen::Lobby;
         self.load_public_rooms();
     }
@@ -1548,6 +1787,16 @@ impl SyncYtmApp {
                         RichText::new("⚡ Resync").strong().size(12.0).color(INFO)
                     ).fill(Color32::TRANSPARENT)).clicked() {
                         self.trigger_resync();
+                    }
+                }
+
+                // Copy invite link
+                if let Some(ref r) = self.current_room.clone() {
+                    let link = format!("https://syncytm.netlify.app/room/{}", r.id);
+                    if ui.add(egui::Button::new(
+                        RichText::new("🔗 Copy Link").size(12.0).color(INFO)
+                    ).fill(Color32::TRANSPARENT)).clicked() {
+                        ui.output_mut(|o| o.copied_text = link);
                     }
                 }
             });
