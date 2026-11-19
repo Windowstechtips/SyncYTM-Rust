@@ -1,6 +1,6 @@
 <div align="center">
 
-# SyncYTM
+# SyncYTM in React
 
 **Listen to YouTube Music together in sync.**
 
